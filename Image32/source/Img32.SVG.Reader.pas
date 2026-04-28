@@ -3,9 +3,9 @@ unit Img32.SVG.Reader;
 (*******************************************************************************
 * Author    :  Angus Johnson                                                   *
 * Version   :  4.9                                                             *
-* Date      :  28 September 2025                                               *
+* Date      :  8 April 2026                                                    *
 * Website   :  https://www.angusj.com                                          *
-* Copyright :  Angus Johnson 2019-2025                                         *
+* Copyright :  Angus Johnson 2019-2026                                         *
 *                                                                              *
 * Purpose   :  Read SVG 2.0 files                                              *
 *                                                                              *
@@ -245,6 +245,9 @@ type
   end;
 
   TGroupElement = class(TShapeElement)
+  private
+    procedure DrawChildrenAndFilter(image: TImage32; const drawDat: TDrawData;
+      filterEl: TBaseElement; useTmpImage: Boolean);
   protected
     procedure Draw(image: TImage32; drawDat: TDrawData); override;
   end;
@@ -269,6 +272,8 @@ type
     maskRec: TRect;
     procedure GetPaths(const drawDat: TDrawData); override;
     procedure ApplyMask(img: TImage32; const drawDat: TDrawData);
+  public
+    constructor Create(parent: TBaseElement; svgEl: TSvgXmlEl); override;
   end;
 
   TSymbolElement = class(TShapeElement)
@@ -791,6 +796,8 @@ end;
 //------------------------------------------------------------------------------
 
 procedure UpdateFontInfo(var drawDat: TDrawData; thisElement: TBaseElement);
+var
+  fontValue: TValue;
 begin
   with thisElement.fDrawData do
   begin
@@ -803,7 +810,12 @@ begin
       drawDat.fontInfo.familyNames := fontInfo.familyNames;
 
     if fontInfo.size > 0 then
-      drawDat.fontInfo.size := fontInfo.size;
+    begin
+      // Convert fontsize+unitType to pixels
+      fontValue.SetValue(fontInfo.size, fontInfo.sizeUnitType);
+      drawDat.fontInfo.size := fontValue.GetValue(drawDat.fontInfo.size, 1);
+      drawDat.fontInfo.sizeUnitType := utPixel;
+    end;
     if fontInfo.spacing <> 0 then
       drawDat.fontInfo.spacing := fontInfo.spacing;
     if fontInfo.textLength > 0 then
@@ -1071,7 +1083,7 @@ var
 begin
   Result := -1;
   if FMod = 0 then Exit;
-  Hash := GetHash(Name);
+  Hash := GetHashCaseSensitive(Name);
   Result := FBuckets[(Hash and $7FFFFFFF) mod FMod];
   while (Result <> -1) and
     ((FItems[Result].Hash <> Hash) or
@@ -1089,14 +1101,17 @@ var
 begin
   Index := FindItemIndex(idName);
   if Index >= 0 then
+  begin
+    element.fId := ''; // ignore duplicate IDs
     Exit; // already exists so ignore;
+  end;
 
   // add new item
   if FCount = Length(FItems) then Grow;
   Index := FCount;
   Inc(FCount);
 
-  Hash := GetHash(idName);
+  Hash := GetHashCaseSensitive(idName);
   Bucket := @FBuckets[(Hash and $7FFFFFFF) mod FMod];
   Item := @FItems[Index];
   Item.Next := Bucket^;
@@ -1283,8 +1298,9 @@ var
   clipPaths : TPathsD;
   clipRec   : TRect;
   dstClipRec: TRect;
+  filterEl  : TBaseElement;
   offsetX, offsetY: integer;
-  fr: TFillRule;
+  fr        : TFillRule;
 begin
   if fChilds.Count = 0 then Exit;
 
@@ -1296,6 +1312,9 @@ begin
 
   maskEl := TMaskElement(FindRefElement(drawDat.maskElRef));
   clipEl := TClipPathElement(FindRefElement(drawDat.clipElRef));
+  filterEl := FindRefElement(drawDat.filterElRef);
+  drawDat.filterElRef := ''; // don't inherit to children
+
   if Assigned(clipEl) then
   begin
     drawDat.clipElRef := '';
@@ -1306,6 +1325,8 @@ begin
       AppendPath(clipPaths, drawPathsO);
       MatrixApply(drawDat.matrix, clipPaths);
       clipRec := Img32.Vector.GetBounds(clipPaths);
+      clipRec.Left := Max(0, clipRec.Left);
+      clipRec.Top := Max(0, clipRec.Top);
     end;
     if IsEmptyRect(clipRec) then Exit;
     dstClipRec := clipRec; // save for blending tmpImg to image
@@ -1314,8 +1335,6 @@ begin
     // to minimize the size of the mask image.
     offsetX := clipRec.Left;
     offsetY := clipRec.Top;
-    if offsetX < 0 then offsetX := 0;
-    if offsetY < 0 then offsetY := 0;
     if (offsetX > 0) or (offsetY > 0) then
     begin
       MatrixTranslate(drawDat.matrix, -offsetX, -offsetY); // for DrawChildren
@@ -1326,7 +1345,7 @@ begin
     //nb: it's not safe to use fReader.TempImage when calling DrawChildren
     tmpImg := TImage32.Create(Min(image.Width, clipRec.Right), Min(image.Height, clipRec.Bottom));
     try
-      DrawChildren(tmpImg, drawDat);
+      DrawChildrenAndFilter(tmpImg, drawDat, filterEl, False);
       if clipEl.fDrawData.fillRule = frNegative then
         fr := frNonZero else
         fr := clipEl.fDrawData.fillRule;
@@ -1362,13 +1381,62 @@ begin
 
     tmpImg := TImage32.Create(Min(image.Width, clipRec.Right), Min(image.Height, clipRec.Bottom));
     try
-      DrawChildren(tmpImg, drawDat);
+      DrawChildrenAndFilter(tmpImg, drawDat, filterEl, False);
       TMaskElement(maskEl).ApplyMask(tmpImg, drawDat);
       image.CopyBlend(tmpImg, clipRec, dstClipRec, BlendToAlphaLine);
     finally
       tmpImg.Free;
     end;
-  end else
+  end
+  else
+    DrawChildrenAndFilter(image, drawDat, filterEl, True);
+end;
+//------------------------------------------------------------------------------
+
+procedure TGroupElement.DrawChildrenAndFilter(image: TImage32;
+  const drawDat: TDrawData; filterEl: TBaseElement; useTmpImage: Boolean);
+var
+  clipRec2: TRectD;
+  clipRec: TRect;
+  tmpImg: TImage32;
+begin
+  // Draw the children into the image and apply an optional group-filter to the image.
+  if Assigned(filterEl) then
+  begin
+    clipRec2 := drawDat.bounds;
+    with TFilterElement(filterEl) do
+    begin
+      MatrixExtractScale(DrawData.matrix, fScale);
+
+      if fUnits = hUserSpaceOnUse then
+        clipRec2 := GetAdjustedBounds(fSvgReader.userSpaceBounds) else
+        clipRec2 := GetAdjustedBounds(clipRec2);
+      if clipRec2.IsEmpty then Exit;
+    end;
+    MatrixApply(drawDat.matrix, clipRec2);
+    clipRec := Rect(clipRec2);
+    Types.IntersectRect(clipRec, clipRec, image.Bounds);
+
+    if useTmpImage then
+    begin
+      tmpImg := TImage32.Create(Min(image.Width, clipRec.Right), Min(image.Height, clipRec.Bottom));
+      try
+        DrawChildren(tmpImg, drawDat);
+        with TFilterElement(filterEl) do
+          Apply(tmpImg, clipRec, drawDat.matrix);
+        image.CopyBlend(tmpImg, clipRec, clipRec, BlendToAlphaLine);
+      finally
+        tmpImg.Free;
+      end;
+    end
+    else
+    begin
+      DrawChildren(image, drawDat);
+      with TFilterElement(filterEl) do
+        Apply(image, clipRec, drawDat.matrix);
+    end;
+  end
+  else
     DrawChildren(image, drawDat);
 end;
 
@@ -1535,6 +1603,13 @@ end;
 
 //------------------------------------------------------------------------------
 // TMaskElement
+//------------------------------------------------------------------------------
+
+constructor TMaskElement.Create(parent: TBaseElement; svgEl: TSvgXmlEl);
+begin
+  inherited;
+  fDrawData.visible := false;
+end;
 //------------------------------------------------------------------------------
 
 procedure TMaskElement.GetPaths(const drawDat: TDrawData);
@@ -1889,8 +1964,9 @@ procedure TFilterElement.Clear;
 var
   i: integer;
 begin
-  for i := 0 to High(fImages) do
-    fImages[i].Free;
+  if Assigned(fImages) then
+    for i := 0 to High(fImages) do
+      fImages[i].Free;
   fImages := nil;
   fNames := nil;
   fLastImg := nil;
@@ -2025,7 +2101,7 @@ begin
 
   if not isIn then Exit;
 
-  case GetHash(name) of
+  case GetHashCaseInsensitive(name) of
     hBackgroundImage:
       Result.Copy(fSvgReader.BackgndImage, fFilterBounds, Result.Bounds);
     hBackgroundAlpha:
@@ -2067,6 +2143,7 @@ var
 begin
   MatrixExtractScale(matrix, fScale);
   fFilterBounds := filterBounds;
+
   Types.IntersectRect(fObjectBounds, fObjectBounds, img.Bounds);
   fSrcImg := img;
 
@@ -2659,6 +2736,7 @@ var
   clipPathEl  : TBaseElement;
   filterEl    : TBaseElement;
   maskEl      : TBaseElement;
+  el          : TBaseElement;
   clipPaths   : TPathsD;
   fillPaths   : TPathsD;
   di          : TDrawData;
@@ -2683,6 +2761,23 @@ begin
   clipRec2 := NullRect;
 
   maskEl := FindRefElement(drawDat.maskElRef);
+
+  // make sure that maskEl is not an ancestor of
+  // self, as this would cause unlimited recursion.
+  if Assigned(maskEl) then
+  begin
+    el := self.fParent;
+    while assigned(el) do
+    begin
+      if el = maskEl then
+      begin
+        maskEl := nil;
+        break;
+      end;
+      el := el.fParent;
+    end;
+  end;
+
   clipPathEl := FindRefElement(drawDat.clipElRef);
   filterEl := FindRefElement(drawDat.filterElRef);
 
@@ -2764,6 +2859,7 @@ begin
           if fUnits = hUserSpaceOnUse then
             clipRec := GetAdjustedBounds(fSvgReader.userSpaceBounds) else
             clipRec := GetAdjustedBounds(clipRec);
+          if clipRec.IsEmpty then Exit;
         end;
       end;
       MatrixApply(drawDat.matrix, clipRec);
@@ -2999,7 +3095,7 @@ var
   refEl: TBaseElement;
   endStyle: TEndStyle;
   joinStyle: TJoinStyle;
-  bounds: TRectD;
+  //bounds: TRectD;
   paths2: TPathsD;
   opacity: Byte;
 begin
@@ -3007,7 +3103,7 @@ begin
   MatrixExtractScale(drawDat.matrix, scale);
   joinStyle := fDrawData.strokeJoin;
 
-  bounds := fSvgReader.userSpaceBounds;
+  //bounds := fSvgReader.userSpaceBounds;
   with drawDat.strokeWidth do
   begin
     if not IsValid then
@@ -3015,7 +3111,8 @@ begin
     else if HasFontUnits then
       sw := GetValue(drawDat.fontInfo.size, GetRelFracLimit)
     else
-      sw := GetValueXY(bounds, 0);
+      sw := GetValueXY(drawDat.bounds, 0);
+      //sw := GetValueXY(bounds, 0);
   end;
 
   miterLim := drawDat.strokeMitLim;
@@ -4221,7 +4318,7 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function  TBaseElement.IsFirstChild: Boolean;
+function TBaseElement.IsFirstChild: Boolean;
 begin
   Result := not Assigned(fParent) or (self = fParent.fChilds[0]);
 end;
@@ -4574,7 +4671,7 @@ end;
 
 procedure Display_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
-  if GetHash(value) = hNone then
+  if GetHashCaseInsensitive(value) = hNone then
     aOwnerEl.fDrawData.visible := false;
 end;
 //------------------------------------------------------------------------------
@@ -4614,19 +4711,21 @@ end;
 
 procedure FontSize_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 var
-  num: double;
   c, endC: PUTF8Char;
+  tmp: TValue;
 begin
   c := PUTF8Char(value); endC := c + Length(value);
-  if not ParseNextNum(c, endC, false, num) then Exit;
-  aOwnerEl.fDrawData.FontInfo.size := num;
+  tmp.Init;
+  if not ParseNextNumEx(c, endC, false, tmp.rawVal, tmp.unitType) then Exit;
+  aOwnerEl.fDrawData.fontInfo.size := tmp.rawVal;
+  aOwnerEl.fDrawData.fontInfo.sizeUnitType := tmp.unitType;
 end;
 //------------------------------------------------------------------------------
 
 procedure FontStyle_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   with aOwnerEl.fDrawData.FontInfo do
-    if GetHash(value) = hItalic then
+    if GetHashCaseInsensitive(value) = hItalic then
       italic := sfsItalic else
       italic := sfsNone;
 end;
@@ -4682,7 +4781,7 @@ end;
 procedure TextAlign_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   with aOwnerEl.fDrawData.FontInfo do
-    case GetHash(value) of
+    case GetHashCaseInsensitive(value) of
       hMiddle   : align := staCenter;
       hEnd      : align := staRight;
       hJustify  : align := staJustify;
@@ -4742,7 +4841,7 @@ procedure FilterUnits_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   if (aOwnerEl is TFilterElement) then
     with TFilterElement(aOwnerEl) do
-      fUnits := GetHash(value);
+      fUnits := GetHashCaseInsensitive(value);
 end;
 //------------------------------------------------------------------------------
 
@@ -4789,7 +4888,7 @@ procedure Operator_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   if (aOwnerEl is TFeCompositeElement) then
     with TFeCompositeElement(aOwnerEl) do
-      case GetHash(value) of
+      case GetHashCaseInsensitive(value) of
         hAtop       : compositeOp := coAtop;
         hIn         : compositeOp := coIn;
         hOut        : compositeOp := coOut;
@@ -4803,7 +4902,7 @@ end;
 procedure Orient_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   if (aOwnerEl is TMarkerElement) and
-    (GetHash(value) = hauto_045_start_045_reverse) then
+    (GetHashCaseInsensitive(value) = hauto_045_start_045_reverse) then
         TMarkerElement(aOwnerEl).autoStartReverse := true;
 end;
 //------------------------------------------------------------------------------
@@ -4996,7 +5095,7 @@ procedure GradientUnits_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
   if aOwnerEl is TFillElement then
     with TFillElement(aOwnerEl) do
-      units := GetHash(value);
+      units := GetHashCaseInsensitive(value);
 end;
 //------------------------------------------------------------------------------
 
@@ -5029,7 +5128,7 @@ end;
 
 procedure Visibility_Attrib(aOwnerEl: TBaseElement; const value: UTF8String);
 begin
-  case GetHash(value) of
+  case GetHashCaseInsensitive(value) of
     hCollapse: aOwnerEl.fDrawData.visible := false;
     hHidden: aOwnerEl.fDrawData.visible := false;
     hVisible: aOwnerEl.fDrawData.visible := true;
@@ -5796,8 +5895,9 @@ var
   bestFontReader: TFontReader;
   fi: TFontInfo;
 begin
-  if svgFontInfo.family = tfUnknown then
-    fi.family := tfSerif else
+  FillChar(fi, SizeOf(fi), 0);
+  fi.fontFormat := ffTrueType;
+  if svgFontInfo.family <> tfUnknown then
     fi.family := svgFontInfo.family;
   fi.faceName := ''; //just match to a family here, not to a specific facename
   fi.macStyles := [];
